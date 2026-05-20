@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Basic network sniffer for Linux using scapy or raw sockets."""
+
+import argparse
+import datetime
+import sys
+import socket
+import struct
+
+try:
+    from scapy.all import sniff, IP, TCP, UDP, ICMP, Raw
+    SCAPY_AVAILABLE = True
+except ImportError:
+    SCAPY_AVAILABLE = False
+
+
+def format_payload(payload, max_bytes=64):
+    if not payload:
+        return ""
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8", errors="replace")
+    payload = bytes(payload)
+    display = payload[:max_bytes]
+    printable = "".join(chr(b) if 32 <= b < 127 else "." for b in display)
+    hex_dump = " ".join(f"{b:02x}" for b in display)
+    return f"payload={len(payload)} bytes, ascii={printable!r}, hex={hex_dump}"
+
+
+def describe_scapy_packet(packet):
+    if not packet.haslayer(IP):
+        print("Non-IP packet captured, skipping")
+        return
+
+    ip = packet[IP]
+    proto = "OTHER"
+    transport_info = ""
+    payload = b""
+
+    if packet.haslayer(TCP):
+        proto = "TCP"
+        tcp = packet[TCP]
+        transport_info = f"sport={tcp.sport}, dport={tcp.dport}, flags={tcp.flags}"
+        payload = bytes(tcp.payload)
+    elif packet.haslayer(UDP):
+        proto = "UDP"
+        udp = packet[UDP]
+        transport_info = f"sport={udp.sport}, dport={udp.dport}"
+        payload = bytes(udp.payload)
+    elif packet.haslayer(ICMP):
+        proto = "ICMP"
+        icmp = packet[ICMP]
+        transport_info = f"type={icmp.type}, code={icmp.code}"
+        payload = bytes(icmp.payload)
+    else:
+        proto = str(ip.proto)
+        payload = bytes(packet[Raw].load) if packet.haslayer(Raw) else b""
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    payload_info = format_payload(payload)
+    print(
+        f"[{timestamp}] {ip.src} -> {ip.dst} | {proto} | {transport_info} | {payload_info}"
+    )
+
+
+def scapy_capture(interface=None, count=0):
+    if interface:
+        print(f"Listening on interface: {interface}")
+    else:
+        print("Listening on default interface")
+
+    sniff(
+        iface=interface,
+        prn=describe_scapy_packet,
+        store=False,
+        count=count if count > 0 else 0,
+    )
+
+
+def parse_ethernet_header(data):
+    if len(data) < 14:
+        return None
+    dst_mac = ":".join(f"{b:02x}" for b in data[0:6])
+    src_mac = ":".join(f"{b:02x}" for b in data[6:12])
+    eth_proto = struct.unpack("!H", data[12:14])[0]
+    payload = data[14:]
+    return dst_mac, src_mac, eth_proto, payload
+
+
+def parse_ipv4_header(data):
+    if len(data) < 20:
+        return None
+    version_ihl = data[0]
+    ihl = (version_ihl & 0x0F) * 4
+    if len(data) < ihl:
+        return None
+    total_length = struct.unpack("!H", data[2:4])[0]
+    protocol = data[9]
+    src = socket.inet_ntoa(data[12:16])
+    dst = socket.inet_ntoa(data[16:20])
+    payload = data[ihl:total_length]
+    return {
+        "src": src,
+        "dst": dst,
+        "proto": protocol,
+        "payload": payload,
+        "ihl": ihl,
+    }
+
+
+def parse_transport_header(proto, payload):
+    if proto == 6 and len(payload) >= 20:  # TCP
+        src_port, dst_port, seq, ack, offset_reserved_flags = struct.unpack("!HHLLH", payload[:14])
+        offset = (offset_reserved_flags >> 12) * 4
+        inner_payload = payload[offset:]
+        return "TCP", f"sport={src_port}, dport={dst_port}", inner_payload
+    if proto == 17 and len(payload) >= 8:  # UDP
+        src_port, dst_port = struct.unpack("!HH", payload[:4])
+        return "UDP", f"sport={src_port}, dport={dst_port}", payload[8:]
+    if proto == 1 and len(payload) >= 4:  # ICMP
+        icmp_type, code = struct.unpack("!BB", payload[:2])
+        return "ICMP", f"type={icmp_type}, code={code}", payload[4:]
+    return str(proto), "", payload
+
+
+def raw_socket_capture(interface, count=0):
+    if interface is None:
+        print("Raw socket capture requires an interface name on Linux.")
+        sys.exit(1)
+
+    print(f"Listening on interface: {interface} using raw socket")
+    try:
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(3))
+        sock.bind((interface, 0))
+    except PermissionError:
+        print("Permission denied: raw socket capture requires root privileges.")
+        sys.exit(1)
+    except OSError as exc:
+        print(f"Socket error: {exc}")
+        sys.exit(1)
+
+    seen = 0
+    while count == 0 or seen < count:
+        raw_data, addr = sock.recvfrom(65535)
+        eth = parse_ethernet_header(raw_data)
+        if not eth:
+            continue
+        dst_mac, src_mac, eth_proto, data = eth
+        if eth_proto != 0x0800:
+            continue
+        ip = parse_ipv4_header(data)
+        if not ip:
+            continue
+        proto_name, transport_info, payload = parse_transport_header(ip["proto"], ip["payload"])
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        payload_info = format_payload(payload)
+        print(
+            f"[{timestamp}] {ip['src']} -> {ip['dst']} | {proto_name} | {transport_info} | {payload_info}"
+        )
+        seen += 1
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Basic Python network sniffer")
+    parser.add_argument("-i", "--interface", help="Network interface to capture packets on")
+    parser.add_argument("-c", "--count", type=int, default=0, help="Number of packets to capture (0 = unlimited)")
+    parser.add_argument("--no-scapy", action="store_true", help="Disable scapy and use raw socket fallback")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if SCAPY_AVAILABLE and not args.no_scapy:
+        scapy_capture(interface=args.interface, count=args.count)
+    else:
+        if not SCAPY_AVAILABLE and not args.no_scapy:
+            print("scapy is not installed; falling back to raw socket capture.")
+        if sys.platform != "linux" and not args.no_scapy:
+            print("Raw socket fallback is supported only on Linux.")
+            sys.exit(1)
+        raw_socket_capture(interface=args.interface, count=args.count)
+
+
+if __name__ == "__main__":
+    main()
