@@ -1,0 +1,48 @@
+# basic network sniffer
+
+A simple Python-based packet sniffer for learning how network traffic flows through a system.
+
+## Features
+
+- Captures packets on a network interface
+- Displays source and destination IP addresses
+- Detects common protocols: TCP, UDP, ICMP
+- Prints transport information and payload details
+- Uses `scapy` when available, with a raw socket fallback on Linux
+
+## Usage
+
+```bash
+python3 sniffer.py -i <interface>
+```
+
+Optional flags:
+
+- `-c, --count`: number of packets to capture (default unlimited)
+- `--no-scapy`: force raw socket capture instead of `scapy`
+## Install Scapy
+
+If you want the script to use `scapy`, install it first:
+
+```bash
+python3 -m pip install --user scapy
+```
+
+If your Python environment is system-managed and blocks `pip` installs, create a virtual environment instead:
+
+```bash
+sudo apt update
+sudo apt install python3-venv
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install scapy
+```
+
+Then run the sniffer with the virtual environment active.
+## Example
+
+```bash
+sudo python3 sniffer.py -i eth0 -c 10
+```
+
+> On Linux, raw socket capture requires root privileges. If `scapy` is not installed, the script will fall back to the raw socket path.
